@@ -1,5 +1,9 @@
 Revision history for Data::Stack::Shared
 
+0.07  2026-07-21
+    - Fix push/pop hanging on a slot abandoned by a killed peer.
+    - Fetch get-magic on optional arguments before testing them.
+
 0.06  2026-07-03
     - Security and robustness hardening; backing files now created mode
       0600 (pass a file-mode argument to new() for cross-user sharing).
