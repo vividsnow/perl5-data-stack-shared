@@ -289,6 +289,21 @@ static inline int stk_push(StkHandle *h, const void *val, uint32_t vlen, double 
  * Pop (LIFO top--)
  * ================================================================ */
 
+/* Wake one blocked pusher, if any. Must run after EVERY committed top--,
+ * whether the pop produced a value or reclaimed an abandoned slot: either
+ * way a slot's worth of room was freed, and pushers parked in stk_push()'s
+ * FUTEX_WAIT have no other waker on this path (only a successful pop,
+ * drain(), or clear() bumps push_wake_seq). The StoreLoad barrier pairs
+ * with the one in the push-wait loop: publish top-- before reading
+ * waiters_push. */
+static inline void stk_wake_pushers(StkHeader *hdr) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&hdr->waiters_push, __ATOMIC_RELAXED) > 0) {
+        __atomic_add_fetch(&hdr->push_wake_seq, 1, __ATOMIC_RELEASE);
+        syscall(SYS_futex, &hdr->push_wake_seq, FUTEX_WAKE, 1, NULL, NULL, 0);
+    }
+}
+
 static inline int stk_try_pop(StkHandle *h, void *out) {
     StkHeader *hdr = h->hdr;
     for (;;) {
@@ -303,18 +318,18 @@ static inline int stk_try_pop(StkHandle *h, void *out) {
                  * reclaimed: that value never existed. top is already
                  * decremented, so retry at the next position down rather than
                  * reporting the stack empty while entries remain below. The
-                 * loop terminates because every iteration lowers top. */
+                 * loop terminates because every iteration lowers top. The
+                 * committed top-- freed room, so wake a blocked pusher just
+                 * as a successful pop would -- otherwise a push_wait() that
+                 * parked while the stack read full sleeps forever now that
+                 * no successful pop can ever follow on an empty stack. */
+                stk_wake_pushers(hdr);
                 continue;
             }
             memcpy(out, stk_slot(h, t - 1), h->elem_size);
             stk_slot_release(&h->ctl[t - 1], gen);
             __atomic_add_fetch(&hdr->stat_pops, 1, __ATOMIC_RELAXED);
-            /* StoreLoad barrier: publish top-- before reading waiters_push. */
-            __atomic_thread_fence(__ATOMIC_SEQ_CST);
-            if (__atomic_load_n(&hdr->waiters_push, __ATOMIC_RELAXED) > 0) {
-                __atomic_add_fetch(&hdr->push_wake_seq, 1, __ATOMIC_RELEASE);
-                syscall(SYS_futex, &hdr->push_wake_seq, FUTEX_WAKE, 1, NULL, NULL, 0);
-            }
+            stk_wake_pushers(hdr);
             return 1;
         }
     }
